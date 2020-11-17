@@ -190,6 +190,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
         # max elems per param group
         self.max_elems_per_comm = []
+        self.legacy_max_elements_per_comm = max_elements_per_comm
 
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
@@ -826,6 +827,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         state_dict['zero_stage'] = ZERO_OPTIMIZATION_OPTIMIZER_STATES
         state_dict['partition_count'] = self.partition_count
         state_dict['num_comm_intervals_per_group'] = self.num_comm_intervals_per_group
+        state_dict['max_elems_per_comm'] = self.max_elems_per_comm
 
         # Remove paddings for DP alignment to enable loading for other alignment values
         fp32_groups_without_padding = self._get_groups_without_padding(
@@ -834,7 +836,9 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
 
         return state_dict
 
-    def _retrieve_group_sub_partition_weights(self, all_partition_fp32_weights):
+    def _retrieve_group_sub_partition_weights(self,
+                                              all_partition_fp32_weights,
+                                              max_elems_per_comm):
         partition_id = dist.get_rank(group=self.dp_process_group)
 
         all_sub_partition_weights = []
@@ -845,13 +849,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         flat_merged_weights = flatten_dense_tensors_sub_partition_aligned(
             tensor_list=all_sub_partition_weights,
             dp=dist.get_world_size(group=self.dp_process_group),
-            max_elements_per_comm=self.max_elements_per_comm,
+            max_elements_per_comm=max_elems_per_comm,
             pg=self.dp_process_group)
 
         comm_partitions, dp_sub_partitions, element_intervals, sub_partition_size, num_comm_intervals = \
             self.get_data_parallel_sub_partitions(
                 tensor=flat_merged_weights,
-                max_elements_per_comm=self.max_elements_per_comm,
+                max_elements_per_comm=max_elems_per_comm,
                 world_size=dist.get_world_size(group=self.dp_process_group),
                 dp_process_group=self.dp_process_group
             )
@@ -869,8 +873,14 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                 sd['local_sub_partitions_of_fp32_groups'][group_idx]
                 for sd in all_state_dict
             ]
+            if 'max_elems_per_comm' in all_state_dict[0]:
+                max_elems_per_comm = all_state_dict[0]['max_elems_per_comm'][group_idx]
+            else:
+                max_elems_per_comm = self.legacy_max_elements_per_comm
+
             sub_partition_weights = self._retrieve_group_sub_partition_weights(
-                all_partition_fp32_weights)
+                all_partition_fp32_weights,
+                max_elems_per_comm)
             sub_partition_of_fp32_groups.append(sub_partition_weights)
 
         for current_group, saved_group in zip(self.local_sub_partitions_of_fp32_groups, sub_partition_of_fp32_groups):
@@ -878,20 +888,23 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
                 current_sub_part.data.copy_(saved_sub_part.data)
 
     # Extract optimizer state for current partition from merged states of all partitions
-    def _partition_base_optimizer_state(self, state_key, all_partition_states):
+    def _partition_base_optimizer_state(self,
+                                        state_key,
+                                        all_partition_states,
+                                        max_elems_per_comm):
         partition_id = dist.get_rank(group=self.dp_process_group)
         alignment = dist.get_world_size(group=self.dp_process_group)
 
         flat_merged_partitions = flatten_dense_tensors_sub_partition_aligned(
             tensor_list=all_partition_states,
             dp=dist.get_world_size(group=self.dp_process_group),
-            max_elements_per_comm=self.max_elements_per_comm,
+            max_elements_per_comm=max_elems_per_comm,
             pg=self.dp_process_group)
 
         comm_partitions, dp_sub_partitions, element_intervals, sub_partition_size, num_comm_intervals = \
             self.get_data_parallel_sub_partitions(
                 tensor=flat_merged_partitions,
-                max_elements_per_comm=self.max_elements_per_comm,
+                max_elements_per_comm=max_elems_per_comm,
                 world_size=dist.get_world_size(group=self.dp_process_group),
                 dp_process_group=self.dp_process_group
             )
@@ -902,7 +915,7 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
     # 1) Merging state values across the previous partitioning.
     # 2) Repartition state values for the new partitioning
     # 3) Return state corresponding to local partition
-    def _retrieve_group_optimizer_states(self, all_partition_states):
+    def _retrieve_group_optimizer_states(self, all_partition_states, max_elems_per_comm):
         merged_optimizer_states = {}
         for partition_state in all_partition_states:
             for sub_partition_state in partition_state:
@@ -916,7 +929,8 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
         for key, value in merged_optimizer_states.items():
             group_optimizer_states[key] = self._partition_base_optimizer_state(
                 key,
-                value)
+                value,
+                max_elems_per_comm)
 
         return group_optimizer_states
 
@@ -930,8 +944,13 @@ class FP16_DeepSpeedZeroOptimizer_Stage1(object):
             all_partition_group_states = [
                 sd['base_optimizer_state'][group_idx] for sd in state_dict_list
             ]
+            if 'max_elems_per_comm' in state_dict_list[0]:
+                max_elems_per_comm = state_dict_list[0]['max_elems_per_comm'][group_idx]
+            else:
+                max_elems_per_comm = self.legacy_max_elements_per_comm
             group_optimizer_states = self._retrieve_group_optimizer_states(
-                all_partition_group_states)
+                all_partition_group_states,
+                max_elems_per_comm)
             base_optimizer_group_states.append(group_optimizer_states)
 
         for group_idx, group in enumerate(self.optimizer.param_groups):
